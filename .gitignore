@@ -1,0 +1,19 @@
+# Node
+client/node_modules/
+client/dist/
+
+# Python
+server/.venv/
+server/__pycache__/
+*.pyc
+
+# App storage & models cache
+server/storage/
+server/app/cache/
+server/app/.cache/
+
+# OS/editor
+.DS_Store
+
+# Secrets
+server/.env
