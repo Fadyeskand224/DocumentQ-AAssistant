@@ -1,0 +1,17 @@
+fastapi==0.115.2
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+pydantic==2.9.2
+pdfplumber==0.11.4
+numpy==1.26.4
+scikit-learn==1.5.2
+
+# Hugging Face / models
+sentence-transformers==3.0.1
+transformers==4.43.3
+
+# CPU FAISS index for similarity search
+faiss-cpu==1.8.0
+
+# Torch (CPU). If this fails on your machine, see note below.
+torch==2.3.1
