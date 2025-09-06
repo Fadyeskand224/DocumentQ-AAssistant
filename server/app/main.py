@@ -33,16 +33,18 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 MAX_CHARS = 160_000          # safety cap on text length processed
 MAX_SENTENCES_EMBED = 800    # cap sentences to embed (speed)
-SUMMARY_SENTENCES = 6        # how many sentences to include in summary/bullets
 MMR_REDUNDANCY = 0.35        # redundancy penalty (0..1), higher = more diverse
 
 # ---------------------------
 # APP
 # ---------------------------
-app = FastAPI(title="Fast Document Summarizer", version="2.0.0")
+app = FastAPI(title="Fast Document Summarizer", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---------------------------
@@ -51,6 +53,167 @@ app.add_middleware(
 print("Loading sentence embedder…")
 embedder = SentenceTransformer(EMBED_MODEL)
 print("Embedder ready.")
+
+# ---------------------------
+# DOC TYPE DETECTION & CLEANUP
+# ---------------------------
+DOC_LETTER = "letter"
+DOC_RESUME = "resume"
+DOC_SLIDES = "slides"
+DOC_PAPER = "paper"
+DOC_GENERIC = "document"
+
+_BULLET_MARKS = r"[•▪●◦·\-–—•♦■✓▶→»·]"
+
+def _detect_doc_type(pages: list[str]) -> str:
+    """
+    Very lightweight heuristics to guess doc type.
+    """
+    text = "\n".join(pages[:2]).lower()
+    first_page = (pages[0] if pages else "").lower()
+
+    # Cover letter cues
+    if first_page.startswith("dear ") or "sincerely" in text or "hiring team" in text:
+        return DOC_LETTER
+
+    # Resume cues
+    resume_keys = ["experience", "education", "skills", "projects", "summary", "objective"]
+    short_lines = sum(1 for ln in first_page.splitlines() if 0 < len(ln.strip()) <= 60)
+    if any(k in text for k in resume_keys) and short_lines > 10:
+        return DOC_RESUME
+
+    # Slides cues
+    slides_keys = ["slide", "©", "chapter", "edition", "lecture", "module", "unit"]
+    bullets_density = sum(bool(re.search(_BULLET_MARKS, ln)) for ln in first_page.splitlines())
+    if any(k in text for k in slides_keys) or bullets_density > 8:
+        return DOC_SLIDES
+
+    # Academic paper cues
+    if "abstract" in text or "references" in text or ("introduction" in text and "doi" in text):
+        return DOC_PAPER
+
+    return DOC_GENERIC
+
+def _subject_for_doc(doc_type: str, author: str | None) -> tuple[str, str]:
+    """
+    Returns (doc_label, subject_noun) for neutralization.
+    """
+    if doc_type == DOC_LETTER:
+        return ("the letter", author or "the applicant")
+    if doc_type == DOC_RESUME:
+        return ("the resume", author or "the candidate")
+    if doc_type == DOC_SLIDES:
+        return ("the slides", "the presenter")
+    if doc_type == DOC_PAPER:
+        return ("the paper", "the author")
+    return ("the document", author or "the author")
+
+def _clean_pages(pages: list[str]) -> str:
+    """
+    Normalize whitespace and remove repeated slide/resume noise.
+    """
+    text = "\n".join(pages)
+
+    # common slide/publisher footers/headers
+    noise_patterns = [
+        r"Operating System Concepts\s*–?\s*10(th)?\s*Edition.*",
+        r"Copyright\s+20\d{2}.*",
+        r"Silberschatz,?\s*Galvin\s*and\s*Gagne.*",
+        r"^\s*Figure\s*\d+.*$",
+        r"^\s*Table\s*\d+.*$",
+        r"^\s*\d+(\.\d+)?\s*$",    # slide/page numbers
+        r"Chapter\s+Introduction.*",
+    ]
+    for pat in noise_patterns:
+        text = re.sub(pat, "", text, flags=re.IGNORECASE | re.MULTILINE)
+
+    # remove bullet glyphs but keep spacing
+    text = re.sub(_BULLET_MARKS, " ", text)
+
+    # collapse whitespace and newlines
+    text = text.replace("\r", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    text = text.strip()
+    return text
+
+def _smart_split_sentences(text: str) -> list[str]:
+    """
+    Split by sentence boundaries and meaningful line breaks.
+    Drops tiny fragments and dedupes near-duplicates.
+    """
+    parts = []
+    for para in text.split("\n"):
+        para = para.strip()
+        if not para:
+            continue
+        # split by terminators
+        chunks = re.split(r"(?<=[\.\?\!])\s+", para)
+        for c in chunks:
+            c = c.strip()
+            if c:
+                parts.append(c)
+
+    # drop small fragments
+    parts = [p for p in parts if len(p) > 25]
+
+    # dedupe near-duplicates
+    seen = set()
+    uniq = []
+    for p in parts:
+        key = re.sub(r"\W+", " ", p).lower().strip()
+        if key not in seen:
+            seen.add(key)
+            uniq.append(p)
+    return uniq
+
+# --- sentence polishing utilities ---
+_VERB_HINTS = set("""
+is are was were be been being has have had built led developed designed improved
+manage managed manages coordinating coordinated coordinate integrate integrated
+implement implemented implementing reduce reduced reducing increase increased increasing
+optimize optimized optimizing analyze analyzed analyzing contribute contributed contributing
+""".split())
+
+_STOPWORDS_END = {"and", "or", "of", "to", "at", "for", "in", "on", "with", "a", "an", "the", "by"}
+
+def _has_verbish(s: str) -> bool:
+    toks = re.findall(r"[A-Za-z']+", s.lower())
+    return any(t in _VERB_HINTS for t in toks) or any(t.endswith(("ed", "ing", "es", "s")) for t in toks)
+
+def _polish_sentence(s: str) -> str | None:
+    # remove lingering bullet symbols
+    s = re.sub(rf"^{_BULLET_MARKS}\s*", "", s).strip()
+
+    # drop leading conjunctions/preambles
+    s = re.sub(r"^(and|or|but|so|also|plus|then)\s+", "", s, flags=re.IGNORECASE).strip()
+
+    # kill mid-line double punctuation and dangling commas
+    s = re.sub(r"\s*,\s*,+", ", ", s)
+    s = re.sub(r"[;:]\s*(,|\.)", ". ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # drop if ends with a stopword fragment
+    last = re.findall(r"[A-Za-z']+$", s)
+    if last and last[0].lower() in _STOPWORDS_END:
+        return None
+
+    # ensure it ends with a period
+    if not s.endswith((".", "!", "?")):
+        s += "."
+
+    # capitalize first letter if sentence looks lowercase
+    if s and s[0].islower():
+        s = s[0].upper() + s[1:]
+
+    # drop very short / non-sentences
+    if len(s) < 30 or not _has_verbish(s):
+        return None
+
+    # remove duplicated spaces before punctuation
+    s = re.sub(r"\s+([,.!?])", r"\1", s)
+
+    return s.strip()
 
 # ---------------------------
 # UTILS
@@ -62,14 +225,6 @@ def _extract_pdf_text_by_page(pdf_path: str) -> List[str]:
             t = page.extract_text() or ""
             pages_text.append(t)
     return pages_text
-
-_SENT_SPLIT = re.compile(r'(?<=[\.\?!])\s+')
-def _split_sentences(text: str) -> List[str]:
-    # basic sentence splitter; filters very short/empty strings
-    sents = [s.strip() for s in _SENT_SPLIT.split(text) if s.strip()]
-    # drop extremely short fragments (e.g., “F/E”, headers)
-    sents = [s for s in sents if len(s) > 20]
-    return sents
 
 def _normalize_rows(mat: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
@@ -139,7 +294,7 @@ def _centroid_mmr(sentences: List[str], k: int, redundancy: float) -> List[int]:
         selected.append(best_i)
         selected_set.add(best_i)
 
-    selected.sort() 
+    selected.sort()
     return selected
 
 def _guess_author_name(pages: List[str]) -> str | None:
@@ -168,8 +323,11 @@ def _guess_author_name(pages: List[str]) -> str | None:
             return name
     return None
 
-def _neutralize_first_person(text: str, author: str | None, doc_label: str = "the document") -> str:
-    subj = author or "the applicant"
+def _neutralize_first_person(text: str, subj: str) -> str:
+    """
+    Rewrite first-person to objective third-person.
+    No automatic 'states that' prefix here—handled by the caller once if needed.
+    """
     rules = [
         (r"\bI am\b", f"{subj} is"),
         (r"\bI'm\b", f"{subj} is"),
@@ -197,53 +355,101 @@ def _neutralize_first_person(text: str, author: str | None, doc_label: str = "th
     out = text
     for pat, rep in rules:
         out = re.sub(pat, rep, out)
-    out = out.strip()
-    if out and not re.match(rf"^{re.escape(subj)}\b|^{doc_label}\b", out):
-        out = f"{doc_label.capitalize()} states that {out[0].lower() + out[1:]}"
-    return out
+    return out.strip()
 
-def summarize_extractive(pages: List[str]) -> Dict[str, Any]:
+# --- dynamic length selection ---
+def _pick_k_sentences(total_sents: int, length: str) -> int:
     """
-    Fast extractive pipeline:
-      1) join pages, cap length
-      2) sentence split
-      3) embed + centroid/MMR selection
-      4) objective-voice rewrite (lightweight)
+    Decide how many sentences to return in the summary based on doc size and user preference.
+    Caps to total_sents to avoid overrun.
+    length ∈ {"auto","short","medium","long","xlong"}
     """
+    length = (length or "auto").lower()
+
+    if length == "short":
+        k = 5
+    elif length == "medium":
+        k = 8
+    elif length == "long":
+        k = 14
+    elif length in ("xlong", "xl", "verylong"):
+        k = 22
+    else:
+        # AUTO: scale with doc size (by # of sentences kept after cleaning)
+        if total_sents <= 12:
+            k = 6
+        elif total_sents <= 50:
+            k = 9
+        elif total_sents <= 150:
+            k = 14
+        else:
+            k = 20
+
+    # stay within bounds
+    k = max(3, min(k, total_sents))
+    return k
+
+# ---------------------------
+# SUMMARIZER
+# ---------------------------
+def summarize_extractive(pages: List[str], length: str = "auto") -> Dict[str, Any]:
+    """
+    Fast extractive pipeline with doc-type aware subject + polished assembly.
+    `length` controls summary size: auto/short/medium/long/xlong
+    """
+    # Detect doc type and author
+    doc_type = _detect_doc_type(pages)
     author = _guess_author_name(pages)
-    full = " ".join(pages)
-    full = " ".join(full.split())
-    if not full:
+    doc_label, subject_noun = _subject_for_doc(doc_type, author)
+
+    raw = _clean_pages(pages)
+    if not raw:
         return {"summary": "", "key_points": []}
 
-    if len(full) > MAX_CHARS:
-        cut = full[:MAX_CHARS]
+    # safety cap
+    if len(raw) > MAX_CHARS:
+        cut = raw[:MAX_CHARS]
         last_dot = cut.rfind(".")
         if last_dot > 200:
             cut = cut[: last_dot + 1]
-        full = cut
+        raw = cut
 
-    sents = _split_sentences(full)
+    sents = _smart_split_sentences(raw)
     if not sents:
         return {"summary": "", "key_points": []}
 
-    # cap sentence count to keep embedding fast
     if len(sents) > MAX_SENTENCES_EMBED:
         sents = sents[:MAX_SENTENCES_EMBED]
 
-    idxs = _centroid_mmr(sents, k=SUMMARY_SENTENCES, redundancy=MMR_REDUNDANCY)
-    chosen = [sents[i] for i in idxs]
+    # choose k based on user preference and doc size
+    k = _pick_k_sentences(len(sents), length)
 
-    # objective voice pass
-    doc_label = "the file" 
-    bullets = []
-    for s in chosen:
-        t = _neutralize_first_person(s, author, doc_label=doc_label)
-        if not t.endswith("."):
-            t += "."
-        bullets.append("• " + t)
+    idxs = _centroid_mmr(sents, k=k, redundancy=MMR_REDUNDANCY)
+    chosen_raw = [sents[i] for i in idxs]
 
-    paragraph = " ".join([re.sub(r"^[•\-\u2022]\s*", "", b).lstrip("• ").strip() for b in bullets])
+    # Neutralize & polish
+    polished = []
+    for s in chosen_raw:
+        s = _neutralize_first_person(s, subject_noun)
+        s = _polish_sentence(s)
+        if s:
+            polished.append(s)
+
+    if not polished:
+        return {"summary": "", "key_points": []}
+
+    # Build paragraph: add a single intro only if helpful (avoid spam)
+    first = polished[0]
+    needs_intro = not re.match(rf"^({re.escape(doc_label)}|{re.escape(subject_noun)})\b", first, flags=re.IGNORECASE)
+    if needs_intro:
+        intro = f"{doc_label.capitalize()} summarizes: "
+        paragraph = intro + " ".join(polished)
+    else:
+        paragraph = " ".join(polished)
+
+    # Build bullets (no prefixes, already objective)
+    bullets = [f"• {s}" if not s.startswith("•") else s for s in polished]
+
     return {"summary": paragraph, "key_points": bullets}
 
 # ---------------------------
@@ -263,7 +469,7 @@ def health():
     return {"ok": True}
 
 @app.post("/upload", response_model=UploadResponse)
-async def upload(file: UploadFile = File(...)):
+async def upload(length: str = "auto", file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
@@ -289,13 +495,44 @@ async def upload(file: UploadFile = File(...)):
 
     # Fast extractive summary
     try:
-        result = summarize_extractive(pages)
+        result = summarize_extractive(pages, length=length)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Summarization failed: {e}")
 
     # Optionally store text
     with open(os.path.join(ddir, "fulltext.txt"), "w") as f:
         f.write("\n\n".join(pages))
+
+    return UploadResponse(
+        doc_id=doc_id,
+        pages=len(pages),
+        summary=result["summary"],
+        key_points=result["key_points"]
+    )
+
+@app.get("/resummarize", response_model=UploadResponse)
+async def resummarize(doc_id: str, length: str = "auto"):
+    """
+    Re-run summarization for an existing document with a new length parameter.
+    Looks up the stored PDF and re-extracts text (fast), then summarizes again.
+    """
+    ddir = os.path.join(STORAGE_DIR, doc_id)
+    pdf_path = os.path.join(ddir, "document.pdf")
+    if not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail="Document not found. Please upload again.")
+
+    try:
+        pages = _extract_pdf_text_by_page(pdf_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF read failed: {e}")
+
+    if sum(len(p) for p in pages) == 0:
+        raise HTTPException(status_code=400, detail="Stored PDF has no extractable text.")
+
+    try:
+        result = summarize_extractive(pages, length=length)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Summarization failed: {e}")
 
     return UploadResponse(
         doc_id=doc_id,
