@@ -1,91 +1,60 @@
+# server/app/main.py
 import os
+# Stability on macOS (no OpenMP storms)
+os.environ["TRANSFORMERS_NO_TF"] = "1"
+os.environ["USE_TF"] = "0"
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import uuid
-import json
-import time
 import shutil
+import re
 from typing import List, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import pdfplumber
 import numpy as np
 
-import faiss
-import torch
-
-from sentence_transformers import SentenceTransformer, CrossEncoder
-from transformers import AutoTokenizer, AutoModelForQuestionAnswering
+from sentence_transformers import SentenceTransformer
 
 # ---------------------------
 # CONFIG
 # ---------------------------
-
 STORAGE_DIR = os.path.join(os.path.dirname(__file__), "..", "storage")
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
-EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-QA_MODEL_NAME = "deepset/roberta-base-squad2"
-
-CHUNK_MAX_TOKENS = 900     # target chunk length
-CHUNK_OVERLAP_TOKENS = 150 # keep context
-TOP_N = 30                 # retrieve top-N for rerank
-TOP_K = 5                  # rerank → top-K for QA
+# Extractive summarization settings
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+MAX_CHARS = 160_000          # safety cap on text length processed
+MAX_SENTENCES_EMBED = 800    # cap sentences to embed (speed)
+SUMMARY_SENTENCES = 6        # how many sentences to include in summary/bullets
+MMR_REDUNDANCY = 0.35        # redundancy penalty (0..1), higher = more diverse
 
 # ---------------------------
 # APP
 # ---------------------------
-
-app = FastAPI(title="Document Q&A Assistant", version="0.1.0")
-
-# CORS - dev only (adjust for production)
+app = FastAPI(title="Fast Document Summarizer", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # set your frontend origin in prod
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
 # ---------------------------
-# MODELS (load once)
+# MODEL LOAD (once)
 # ---------------------------
-
-print("Loading models...")
-embedder = SentenceTransformer(EMBED_MODEL_NAME)
-reranker = CrossEncoder(RERANK_MODEL_NAME)
-qa_tokenizer = AutoTokenizer.from_pretrained(QA_MODEL_NAME)
-qa_model = AutoModelForQuestionAnswering.from_pretrained(QA_MODEL_NAME)
-qa_model.eval()
-print("Models loaded.")
+print("Loading sentence embedder…")
+embedder = SentenceTransformer(EMBED_MODEL)
+print("Embedder ready.")
 
 # ---------------------------
 # UTILS
 # ---------------------------
-
-def _doc_dir(doc_id: str) -> str:
-    d = os.path.join(STORAGE_DIR, doc_id)
-    os.makedirs(d, exist_ok=True)
-    return d
-
-def _normalize(vecs: np.ndarray) -> np.ndarray:
-    # cosine similarity with FAISS IP requires normalized vectors
-    norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
-    return vecs / norms
-
-def _chunk_text(text: str, max_tokens: int = CHUNK_MAX_TOKENS, overlap: int = CHUNK_OVERLAP_TOKENS) -> List[str]:
-    # Simple whitespace token-based chunking
-    toks = text.split()
-    chunks = []
-    i = 0
-    while i < len(toks):
-        chunk = toks[i:i+max_tokens]
-        chunks.append(" ".join(chunk))
-        i += max_tokens - overlap
-    return chunks
-
 def _extract_pdf_text_by_page(pdf_path: str) -> List[str]:
     pages_text = []
     with pdfplumber.open(pdf_path) as pdf:
@@ -94,192 +63,243 @@ def _extract_pdf_text_by_page(pdf_path: str) -> List[str]:
             pages_text.append(t)
     return pages_text
 
-def _build_faiss_index(embeddings: np.ndarray) -> faiss.IndexFlatIP:
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)
-    index.add(embeddings.astype(np.float32))
-    return index
+_SENT_SPLIT = re.compile(r'(?<=[\.\?!])\s+')
+def _split_sentences(text: str) -> List[str]:
+    # basic sentence splitter; filters very short/empty strings
+    sents = [s.strip() for s in _SENT_SPLIT.split(text) if s.strip()]
+    # drop extremely short fragments (e.g., “F/E”, headers)
+    sents = [s for s in sents if len(s) > 20]
+    return sents
 
-def _save_index(index: faiss.IndexFlatIP, path: str) -> None:
-    faiss.write_index(index, path)
+def _normalize_rows(mat: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
+    return mat / norms
 
-def _load_index(path: str) -> faiss.Index:
-    return faiss.read_index(path)
+def _centroid_mmr(sentences: List[str], k: int, redundancy: float) -> List[int]:
+    """
+    Select k sentences using centroid similarity with MMR-style redundancy penalty.
+    Returns indices into `sentences` preserving original order.
+    Robust to single-sentence / 1D embeddings.
+    """
+    # Embed with MiniLM (fast); force numpy + normalized vectors
+    embs = embedder.encode(
+        sentences,
+        batch_size=64,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )
+    embs = np.asarray(embs, dtype=np.float32)
+    if embs.ndim == 1:  # (d,) -> (1, d)
+        embs = embs.reshape(1, -1)
 
-def _softmax(x: np.ndarray) -> np.ndarray:
-    x = x - np.max(x)
-    e = np.exp(x)
-    return e / (np.sum(e) + 1e-12)
+    # centroid similarity
+    centroid = embs.mean(axis=0, keepdims=True)   # (1, d)
+    # embs and centroid are already normalized, so dot = cosine
+    centrality = (embs @ centroid.T).ravel()      # (n,)
+
+    k = min(k, len(sentences))
+    if k <= 0:
+        return []
+
+    selected: List[int] = []
+    selected_set = set()
+
+    # pick most central first
+    first = int(np.argmax(centrality))
+    selected.append(first)
+    selected_set.add(first)
+
+    # greedy MMR
+    for _ in range(1, k):
+        best_i = None
+        best_score = -1e9
+        # precompute selected matrix
+        sel_idx = np.array(selected, dtype=int)
+        sel_mat = embs[sel_idx, :]                 # (s, d)
+        if sel_mat.ndim == 1:                      # (d,) -> (1, d)
+            sel_mat = sel_mat.reshape(1, -1)
+
+        for i in range(len(sentences)):
+            if i in selected_set:
+                continue
+            # centrality
+            c = centrality[i]
+            # redundancy penalty: max cosine sim to any selected
+            v = embs[i:i+1, :]                     # (1, d)
+            sims = (v @ sel_mat.T).ravel()         # (s,)
+            red = float(sims.max()) if sims.size else 0.0
+            score = c - redundancy * red
+            if score > best_score:
+                best_score = score
+                best_i = i
+
+        if best_i is None:
+            break
+        selected.append(best_i)
+        selected_set.add(best_i)
+
+    selected.sort() 
+    return selected
+
+def _guess_author_name(pages: List[str]) -> str | None:
+    """
+    Very light heuristic to detect a name on page 1.
+    """
+    text = "\n".join(pages[:1])
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    # look near signature
+    sig_idx = None
+    for i, l in enumerate(lines):
+        if re.search(r'@', l) or re.search(r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b', l):
+            sig_idx = i
+            break
+    candidates = []
+    if sig_idx is not None:
+        for j in range(max(0, sig_idx-3), sig_idx):
+            candidates.append(lines[j])
+    candidates = lines[:4] + candidates
+    for c in candidates:
+        parts = [p for p in re.split(r'\s+', c) if p and p.isalpha()]
+        if len(parts) >= 2 and all(p[0].isupper() for p in parts[:2]):
+            name = " ".join(parts[:2])
+            if name.isupper():
+                name = name.title()
+            return name
+    return None
+
+def _neutralize_first_person(text: str, author: str | None, doc_label: str = "the document") -> str:
+    subj = author or "the applicant"
+    rules = [
+        (r"\bI am\b", f"{subj} is"),
+        (r"\bI'm\b", f"{subj} is"),
+        (r"\bI was\b", f"{subj} was"),
+        (r"\bI have\b", f"{subj} has"),
+        (r"\bI've\b", f"{subj} has"),
+        (r"\bI had\b", f"{subj} had"),
+        (r"\bI will\b", f"{subj} will"),
+        (r"\bI'll\b", f"{subj} will"),
+        (r"\bI can\b", f"{subj} can"),
+        (r"\bI built\b", f"{subj} built"),
+        (r"\bI led\b", f"{subj} led"),
+        (r"\bI developed\b", f"{subj} developed"),
+        (r"\bI designed\b", f"{subj} designed"),
+        (r"\bI improved\b", f"{subj} improved"),
+        (r"\bI\b", subj),
+        (r"\bmy\b", f"{subj}'s"),
+        (r"\bme\b", subj),
+        (r"\bmine\b", f"{subj}'s"),
+        (r"\bour\b", "the team’s"),
+        (r"\bours\b", "the team’s"),
+        (r"\bwe\b", "the team"),
+        (r"\bWe\b", "The team"),
+    ]
+    out = text
+    for pat, rep in rules:
+        out = re.sub(pat, rep, out)
+    out = out.strip()
+    if out and not re.match(rf"^{re.escape(subj)}\b|^{doc_label}\b", out):
+        out = f"{doc_label.capitalize()} states that {out[0].lower() + out[1:]}"
+    return out
+
+def summarize_extractive(pages: List[str]) -> Dict[str, Any]:
+    """
+    Fast extractive pipeline:
+      1) join pages, cap length
+      2) sentence split
+      3) embed + centroid/MMR selection
+      4) objective-voice rewrite (lightweight)
+    """
+    author = _guess_author_name(pages)
+    full = " ".join(pages)
+    full = " ".join(full.split())
+    if not full:
+        return {"summary": "", "key_points": []}
+
+    if len(full) > MAX_CHARS:
+        cut = full[:MAX_CHARS]
+        last_dot = cut.rfind(".")
+        if last_dot > 200:
+            cut = cut[: last_dot + 1]
+        full = cut
+
+    sents = _split_sentences(full)
+    if not sents:
+        return {"summary": "", "key_points": []}
+
+    # cap sentence count to keep embedding fast
+    if len(sents) > MAX_SENTENCES_EMBED:
+        sents = sents[:MAX_SENTENCES_EMBED]
+
+    idxs = _centroid_mmr(sents, k=SUMMARY_SENTENCES, redundancy=MMR_REDUNDANCY)
+    chosen = [sents[i] for i in idxs]
+
+    # objective voice pass
+    doc_label = "the file" 
+    bullets = []
+    for s in chosen:
+        t = _neutralize_first_person(s, author, doc_label=doc_label)
+        if not t.endswith("."):
+            t += "."
+        bullets.append("• " + t)
+
+    paragraph = " ".join([re.sub(r"^[•\-\u2022]\s*", "", b).lstrip("• ").strip() for b in bullets])
+    return {"summary": paragraph, "key_points": bullets}
 
 # ---------------------------
 # SCHEMAS
 # ---------------------------
-
-class QARequest(BaseModel):
+class UploadResponse(BaseModel):
     doc_id: str
-    question: str
-
-class QAResponse(BaseModel):
-    answer: str
-    confidence: float
-    citations: List[Dict[str, Any]]
-    retrieval_time_ms: int
+    pages: int
+    summary: str
+    key_points: List[str]
 
 # ---------------------------
 # ROUTES
 # ---------------------------
-
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.post("/upload")
+@app.post("/upload", response_model=UploadResponse)
 async def upload(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
+    # Save PDF
     doc_id = str(uuid.uuid4())[:8]
-    ddir = _doc_dir(doc_id)
+    ddir = os.path.join(STORAGE_DIR, doc_id)
+    os.makedirs(ddir, exist_ok=True)
     pdf_path = os.path.join(ddir, "document.pdf")
-
-    # save pdf
     with open(pdf_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # extract pages → chunk → embed → index
-    pages = _extract_pdf_text_by_page(pdf_path)
+    # Extract text
+    try:
+        pages = _extract_pdf_text_by_page(pdf_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF read failed: {e}")
+
     if sum(len(p) for p in pages) == 0:
-        raise HTTPException(status_code=400, detail="No extractable text found in PDF.")
-
-    chunks_meta = []  # [{chunk_id, page, text}]
-    all_chunks = []
-    for p_idx, page_text in enumerate(pages):
-        if not page_text.strip():
-            continue
-        page_chunks = _chunk_text(page_text)
-        for ch in page_chunks:
-            if ch.strip():
-                chunk_id = str(uuid.uuid4())[:8]
-                chunks_meta.append({
-                    "chunk_id": chunk_id,
-                    "page": p_idx + 1,
-                    "text": ch
-                })
-                all_chunks.append(ch)
-
-    # embeddings
-    emb = embedder.encode(all_chunks, normalize_embeddings=True, batch_size=64, show_progress_bar=False)
-    emb = emb.astype(np.float32)
-
-    # FAISS index (cosine via IP b/c we normalized)
-    index = _build_faiss_index(emb)
-    _save_index(index, os.path.join(ddir, "index.faiss"))
-
-    # save metadata
-    with open(os.path.join(ddir, "chunks.json"), "w") as f:
-        json.dump(chunks_meta, f)
-
-    return {"doc_id": doc_id, "pages": len(pages), "chunks": len(chunks_meta)}
-
-@app.post("/qa", response_model=QAResponse)
-async def qa(req: QARequest):
-    doc_id = req.doc_id
-    question = req.question.strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="Question is empty.")
-
-    ddir = _doc_dir(doc_id)
-    index_path = os.path.join(ddir, "index.faiss")
-    chunks_path = os.path.join(ddir, "chunks.json")
-
-    if not (os.path.exists(index_path) and os.path.exists(chunks_path)):
-        raise HTTPException(status_code=404, detail="Document not found or not indexed.")
-
-    index = _load_index(index_path)
-    with open(chunks_path, "r") as f:
-        chunks_meta = json.load(f)
-
-    # retrieve
-    t0 = time.time()
-    q_emb = embedder.encode([question], normalize_embeddings=True, show_progress_bar=False).astype(np.float32)
-    D, I = index.search(q_emb, TOP_N)  # cosine similarities because normalized
-    retrieved = [(int(idx), float(sim)) for idx, sim in zip(I[0], D[0]) if idx != -1]
-
-    # prepare passages
-    passages = [chunks_meta[i]["text"] for i, _ in retrieved]
-    pairs = [(question, p) for p in passages]
-
-    # rerank
-    if len(pairs) > 0:
-        rr_scores = reranker.predict(pairs)  # higher is better
-        rr = list(zip(range(len(passages)), rr_scores))
-        rr.sort(key=lambda x: x[1], reverse=True)
-        top = rr[: min(TOP_K, len(rr))]
-    else:
-        top = []
-
-    # extractive QA over top passages
-    best_answer = ""
-    best_conf = 0.0
-    best_citation = None
-
-    for idx, rr_score in top:
-        p_text = passages[idx]
-        inputs = qa_tokenizer(question, p_text, return_tensors="pt", truncation=True, max_length=512)
-        with torch.no_grad():
-            outputs = qa_model(**inputs)
-            start_scores = outputs.start_logits[0].numpy()
-            end_scores = outputs.end_logits[0].numpy()
-
-        # find best span
-        start_idx = int(np.argmax(start_scores))
-        end_idx = int(np.argmax(end_scores))
-        if end_idx < start_idx:
-            continue
-
-        input_ids = inputs["input_ids"][0].numpy().tolist()
-        answer_ids = input_ids[start_idx : end_idx + 1]
-        ans = qa_tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
-
-        # approximate confidence
-        span_score = (start_scores[start_idx] + end_scores[end_idx]) / 2.0
-        # combine with rerank score (simple min-max scaling)
-        rr_min, rr_max = float(min(r for _, r in top)), float(max(r for _, r in top))
-        rr_norm = (rr_score - rr_min) / (rr_max - rr_min + 1e-12)
-        conf = float(0.5 * rr_norm + 0.5 * (span_score / (abs(span_score) + 10)))  # crude calibration
-
-        if ans and conf > best_conf:
-            best_conf = conf
-            best_answer = ans
-            global_idx = retrieved[idx][0]
-            best_citation = {
-                "page": chunks_meta[global_idx]["page"],
-                "chunk_id": chunks_meta[global_idx]["chunk_id"],
-                "text": chunks_meta[global_idx]["text"][:500],  # snippet cap
-            }
-
-    latency_ms = int((time.time() - t0) * 1000)
-
-    # fallback when unsure
-    if not best_answer or best_conf < 0.25:
-        # return top 3 passages as evidence
-        citations = []
-        for i, _sim in retrieved[:3]:
-            citations.append({
-                "page": chunks_meta[i]["page"],
-                "chunk_id": chunks_meta[i]["chunk_id"],
-                "text": chunks_meta[i]["text"][:500]
-            })
-        return QAResponse(
-            answer="I'm not confident enough to answer. Here are the most relevant passages.",
-            confidence=round(float(best_conf), 3),
-            citations=citations,
-            retrieval_time_ms=latency_ms
+        raise HTTPException(
+            status_code=400,
+            detail="No extractable text found in PDF. (Scanned images need OCR — we can add that next.)"
         )
 
-    return QAResponse(
-        answer=best_answer,
-        confidence=round(float(best_conf), 3),
-        citations=[best_citation] if best_citation else [],
-        retrieval_time_ms=latency_ms
+    # Fast extractive summary
+    try:
+        result = summarize_extractive(pages)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Summarization failed: {e}")
+
+    # Optionally store text
+    with open(os.path.join(ddir, "fulltext.txt"), "w") as f:
+        f.write("\n\n".join(pages))
+
+    return UploadResponse(
+        doc_id=doc_id,
+        pages=len(pages),
+        summary=result["summary"],
+        key_points=result["key_points"]
     )

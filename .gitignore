@@ -17,3 +17,4 @@ server/app/.cache/
 
 # Secrets
 server/.env
+.env
