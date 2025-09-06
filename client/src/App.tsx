@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { uploadPdf, resummarize } from "./api";
 import "./App.css";
 
@@ -41,6 +41,16 @@ export default function App() {
   const [uploading, setUploading] = useState(false);
   const [resumming, setResumming] = useState(false);
 
+  // NEW: local preview of the uploaded PDF (no backend changes)
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+
+  // Revoke blob URLs on unmount to avoid leaks
+  useEffect(() => {
+    return () => {
+      if (pdfUrl) URL.revokeObjectURL(pdfUrl);
+    };
+  }, [pdfUrl]);
+
   function showError(e: any, fallback: string) {
     const msg = e?.response?.data?.detail || e?.message || fallback;
     alert(msg);
@@ -49,6 +59,13 @@ export default function App() {
 
   async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
     if (!e.target.files?.[0]) return;
+    const file = e.target.files[0];
+
+    // set local preview URL immediately
+    if (pdfUrl) URL.revokeObjectURL(pdfUrl);
+    const blobUrl = URL.createObjectURL(file);
+    setPdfUrl(blobUrl);
+
     setUploading(true);
     setDocId("");
     setSummary("");
@@ -56,13 +73,14 @@ export default function App() {
     setPages(0);
 
     try {
-      const res = await uploadPdf(e.target.files[0], length);
+      const res = await uploadPdf(file, length);
       setDocId(res.doc_id);
       setPages(res.pages);
       setSummary(res.summary);
       setKeyPoints(res.key_points || []);
     } catch (err: any) {
       showError(err, "Upload failed");
+      // if the upload failed, keep the preview but you can clear it if preferred
     } finally {
       setUploading(false);
     }
@@ -134,6 +152,33 @@ export default function App() {
           )}
         </div>
 
+        {/* NEW: PDF Preview Pane (appears once a file is chosen) */}
+        {pdfUrl && (
+          <div className="preview">
+            {/* Use the browser's PDF viewer so users can scroll all pages */}
+            <object
+              data={pdfUrl}
+              type="application/pdf"
+              className="preview-frame"
+              aria-label="PDF preview"
+            >
+              {/* Fallback for environments without inline PDF support */}
+              <div className="preview-fallback">
+                <p>PDF preview isn’t supported in this browser.</p>
+                <a className="open-link" href={pdfUrl} target="_blank" rel="noreferrer">
+                  Open PDF in a new tab
+                </a>
+              </div>
+            </object>
+            <div className="preview-actions">
+              <a className="open-link" href={pdfUrl} target="_blank" rel="noreferrer">
+                Open in new tab
+              </a>
+            </div>
+          </div>
+        )}
+
+        {/* Controls */}
         <div className="controls">
           {/* Length selector */}
           <label className="select">

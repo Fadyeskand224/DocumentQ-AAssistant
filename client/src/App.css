@@ -23,17 +23,17 @@
 * { box-sizing: border-box; }
 
 html, body, #root {
-  min-height: 100vh;                 /* allow page to grow */
+  min-height: 100vh;
   width: 100%;
   margin: 0;
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
     "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji";
   background: var(--bg);
   color: var(--text);
-  overflow-y: auto;                  /* ensure page scrolls when content is long */
+  overflow-y: auto;                  /* allow full page scroll */
 }
 
-/* Full-screen animated gradient background (unchanged) */
+/* Full-screen animated gradient background */
 .app-bg {
   position: fixed;
   inset: 0;
@@ -57,14 +57,27 @@ html, body, #root {
   100% { transform: translateY(-2%) rotate(3deg); filter: hue-rotate(10deg) blur(60px); }
 }
 
-/* Page content container (centered horizontally; scrolls vertically) */
+/* Top-left brand logo */
+.brand-logo {
+  position: fixed;
+  top: 18px;
+  left: 22px;
+  height: 42px;
+  object-fit: contain;
+  z-index: 1000;
+  filter: drop-shadow(0 2px 6px rgba(0,0,0,0.4));
+  user-select: none;
+  pointer-events: none;
+}
+
+/* Page content container */
 .app {
   position: relative;
-  z-index: 1;                        /* above background */
+  z-index: 1;
   max-width: 980px;
   width: 100%;
-  margin: 56px auto 72px;            /* top/bottom space + horizontal center */
-  padding: 0 24px;                   /* gutters */
+  margin: 56px auto 72px;
+  padding: 0 24px;
 }
 
 /* Header */
@@ -75,16 +88,6 @@ html, body, #root {
   gap: 14px;
   margin: 0 auto 22px;
   text-align: center;
-}
-
-.logo {
-  width: 44px; height: 44px;
-  display: grid; place-items: center;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  color: #0a0b10;
-  font-weight: 800;
-  border-radius: 12px;
-  box-shadow: var(--shadow-2), inset 0 0 12px rgba(255,255,255,0.15);
 }
 
 .header-text {
@@ -115,26 +118,52 @@ html, body, #root {
   max-width: 840px;
   width: 100%;
   margin: 0 auto;
-  overflow: hidden;                  /* keep rounded corners clean */
+  overflow: hidden;
 }
 
-/* Header strip in card */
+/* Card header strip */
 .card-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 18px 22px;                /* breathing room */
+  padding: 18px 22px;
   border-bottom: 1px solid rgba(255,255,255,0.12);
   background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03));
 }
 
-/* Controls row */
+/* NEW: PDF preview panel */
+.preview {
+  padding: 16px 18px 10px;
+}
+.preview-frame {
+  width: 100%;
+  height: min(70vh, 900px);          /* tall enough but not full screen */
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 12px;
+  background: #11161e;               /* dark canvas behind PDF */
+  box-shadow: var(--shadow-1);
+  overflow: hidden;                   /* keep rounded corners */
+  display: block;
+}
+.preview-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+.open-link {
+  color: var(--text);
+  opacity: 0.85;
+  font-size: 12px;
+  text-decoration: underline;
+}
+
+/* Controls */
 .controls {
   display: grid;
   grid-template-columns: 1fr;
   gap: 16px;
-  padding: 22px;                      /* inner padding so text never hugs edges */
+  padding: 22px;
   justify-items: center;
 }
 @media (min-width: 720px) {
@@ -168,7 +197,7 @@ html, body, #root {
   box-shadow: 0 0 0 6px var(--ring);
 }
 
-/* File input – visually hidden, custom button label */
+/* File input */
 .file-wrap { display: inline-flex; align-items: center; gap: 10px; }
 .file-hidden {
   position: absolute;
@@ -215,7 +244,7 @@ html, body, #root {
 .btn:active  { transform: translateY(0);    filter: brightness(0.98); }
 .btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
-/* Badges */
+/* Badge */
 .badge {
   display: inline-flex;
   align-items: center;
@@ -230,7 +259,7 @@ html, body, #root {
 
 /* Results */
 .results {
-  padding: 24px 28px 28px;           /* roomy inner padding */
+  padding: 24px 28px 28px;
   text-align: left;
 }
 
@@ -250,20 +279,20 @@ html, body, #root {
   margin: 0;
   line-height: 1.7;
   color: #f1f4ff;
-  max-width: 72ch;                    /* readable line length */
+  max-width: 72ch;
   width: 100%;
-  background: rgba(255,255,255,0.04); /* soft panel */
+  background: rgba(255,255,255,0.04);
   border-left: 3px solid var(--accent);
   border-radius: 12px;
   padding: 14px 16px;
-  overflow-wrap: anywhere;            /* no horizontal overflow */
+  overflow-wrap: anywhere;
 }
 
 /* Key points list */
 .results ul {
   margin: 12px 0 0 0;
   padding: 0;
-  list-style: none;                   /* custom markers */
+  list-style: none;
   max-width: 72ch;
   width: 100%;
 }
@@ -278,7 +307,7 @@ html, body, #root {
   border-radius: 10px;
   padding: 10px 12px;
   margin: 8px 0;
-  overflow-wrap: anywhere;            /* wrap long tokens/URLs */
+  overflow-wrap: anywhere;
 }
 .results li::before {
   content: "✓";
@@ -288,7 +317,7 @@ html, body, #root {
   color: var(--accent-2);
 }
 
-/* Footer hint */
+/* Footer */
 .footer {
   max-width: 840px;
   margin: 22px auto 0;
@@ -298,7 +327,7 @@ html, body, #root {
   opacity: 0.9;
 }
 
-/* Tiny loader dot wave */
+/* Loader */
 .loader {
   display: inline-grid;
   grid-auto-flow: column;
@@ -315,17 +344,4 @@ html, body, #root {
 @keyframes pulse {
   0%, 100% { transform: translateY(0); opacity: 0.6; }
   50%      { transform: translateY(-4px); opacity: 1; }
-}
-
-/* Top-left brand logo */
-.brand-logo {
-  position: fixed;
-  top: 5px;
-  left: 12px;
-  height: 125px;                   /* fits neatly in the corner */
-  object-fit: contain;
-  z-index: 1000;                   /* stays above background */
-  filter: drop-shadow(0 2px 6px rgba(0,0,0,0.4));
-  user-select: none;
-  pointer-events: none;            /* ensures it doesn't block clicks */
 }
