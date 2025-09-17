@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { uploadPdf, resummarize } from "./api";
+import { uploadPdf, resummarize, pdfUrlFor } from "./api";
 import "./App.css";
 
 function UploadIcon() {
@@ -33,6 +33,7 @@ export default function App() {
 
   const [summary, setSummary] = useState<string>("");
   const [keyPoints, setKeyPoints] = useState<string[]>([]);
+  const [keyPointPages, setKeyPointPages] = useState<number[]>([]); // 0-based page indexes
 
   const [length, setLength] = useState<
     "auto" | "short" | "medium" | "long" | "xlong"
@@ -41,15 +42,38 @@ export default function App() {
   const [uploading, setUploading] = useState(false);
   const [resumming, setResumming] = useState(false);
 
-  // NEW: local preview of the uploaded PDF (no backend changes)
-  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  // Preview sources
+  const [localBlobUrl, setLocalBlobUrl] = useState<string | null>(null);
+  const [serverPdfUrl, setServerPdfUrl] = useState<string | null>(null);
 
-  // Revoke blob URLs on unmount to avoid leaks
+  // Parameters for PDF viewer
+  const [viewerPage, setViewerPage] = useState<number | null>(null); // 1-based
+  const [viewerSearch, setViewerSearch] = useState<string | null>(null);
+
+  // Force the iframe to reload when we change page/search
+  const [iframeKey, setIframeKey] = useState<number>(0);
+
+  // Build the viewer URL in a stable order so browsers honor it
+  function buildViewerUrl(): string | null {
+    if (serverPdfUrl) {
+      const params: string[] = [];
+      if (viewerPage) params.push(`page=${viewerPage}`);
+      // Helpful default: fit to width
+      params.push("view=FitH");
+      if (viewerSearch) params.push(`search=${encodeURIComponent(viewerSearch)}`);
+      return `${serverPdfUrl}#${params.join("&")}`;
+    }
+    return localBlobUrl; // blob preview before upload response arrives
+  }
+
+  const previewUrl = buildViewerUrl();
+
+  // cleanup blob URLs
   useEffect(() => {
     return () => {
-      if (pdfUrl) URL.revokeObjectURL(pdfUrl);
+      if (localBlobUrl) URL.revokeObjectURL(localBlobUrl);
     };
-  }, [pdfUrl]);
+  }, [localBlobUrl]);
 
   function showError(e: any, fallback: string) {
     const msg = e?.response?.data?.detail || e?.message || fallback;
@@ -61,15 +85,19 @@ export default function App() {
     if (!e.target.files?.[0]) return;
     const file = e.target.files[0];
 
-    // set local preview URL immediately
-    if (pdfUrl) URL.revokeObjectURL(pdfUrl);
-    const blobUrl = URL.createObjectURL(file);
-    setPdfUrl(blobUrl);
+    // Immediate local preview
+    if (localBlobUrl) URL.revokeObjectURL(localBlobUrl);
+    setLocalBlobUrl(URL.createObjectURL(file));
+    setServerPdfUrl(null);
+    setViewerPage(null);
+    setViewerSearch(null);
+    setIframeKey((k) => k + 1); // ensure the blob loads fresh
 
     setUploading(true);
     setDocId("");
     setSummary("");
     setKeyPoints([]);
+    setKeyPointPages([]);
     setPages(0);
 
     try {
@@ -78,9 +106,11 @@ export default function App() {
       setPages(res.pages);
       setSummary(res.summary);
       setKeyPoints(res.key_points || []);
+      setKeyPointPages(res.key_point_pages || []);
+      setServerPdfUrl(pdfUrlFor(res.doc_id)); // enable #page/#search
+      setIframeKey((k) => k + 1);             // refresh to server URL
     } catch (err: any) {
       showError(err, "Upload failed");
-      // if the upload failed, keep the preview but you can clear it if preferred
     } finally {
       setUploading(false);
     }
@@ -94,10 +124,45 @@ export default function App() {
       setPages(res.pages);
       setSummary(res.summary);
       setKeyPoints(res.key_points || []);
+      setKeyPointPages(res.key_point_pages || []);
+      if (!serverPdfUrl) setServerPdfUrl(pdfUrlFor(docId));
+      setIframeKey((k) => k + 1); // refresh if needed
     } catch (err: any) {
       showError(err, "Resummarize failed");
     } finally {
       setResumming(false);
+    }
+  }
+
+  // Build a concise, “searchable” term from a key point
+  function searchTermFromKeyPoint(text: string): string {
+    const t = text.replace(/^•\s*/, "").trim();
+    const words = t.split(/\s+/).filter((w) =>
+      w.replace(/[^a-zA-Z]/g, "").length > 2
+    );
+    return words.slice(0, 8).join(" ");
+  }
+
+  // Jump to page & highlight in the embedded viewer
+  function jumpToKeyPoint(idx: number) {
+    const pageZeroBased = keyPointPages?.[idx];
+    const kpText = keyPoints?.[idx] || "";
+    if (pageZeroBased == null || !kpText) return;
+
+    const oneBased = pageZeroBased + 1;
+    setViewerPage(oneBased);
+    setViewerSearch(searchTermFromKeyPoint(kpText));
+    setIframeKey((k) => k + 1); // force iframe reload
+
+    // Ensure the preview is in view (outer page scroll only)
+    const el = document.querySelector(".preview");
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+
+    // Subtle flash to signal navigation
+    const p = document.querySelector(".preview");
+    if (p) {
+      p.classList.add("preview-flash");
+      window.setTimeout(() => p.classList.remove("preview-flash"), 600);
     }
   }
 
@@ -116,9 +181,7 @@ export default function App() {
       <div className="header">
         <div className="header-text">
           <h1 className="title">STUDYFIRE</h1>
-          <p className="subtitle">
-            Futuristic summaries for anything you upload.
-          </p>
+        <p className="subtitle">Futuristic summaries for anything you upload.</p>
         </div>
       </div>
 
@@ -152,26 +215,23 @@ export default function App() {
           )}
         </div>
 
-        {/* NEW: PDF Preview Pane (appears once a file is chosen) */}
-        {pdfUrl && (
+        {/* PDF Preview Pane */}
+        {previewUrl && (
           <div className="preview">
-            {/* Use the browser's PDF viewer so users can scroll all pages */}
-            <object
-              data={pdfUrl}
-              type="application/pdf"
+            {/* Use iframe so #page & #search work; 'key' forces reload on param change */}
+            <iframe
+              key={iframeKey}
               className="preview-frame"
-              aria-label="PDF preview"
-            >
-              {/* Fallback for environments without inline PDF support */}
-              <div className="preview-fallback">
-                <p>PDF preview isn’t supported in this browser.</p>
-                <a className="open-link" href={pdfUrl} target="_blank" rel="noreferrer">
-                  Open PDF in a new tab
-                </a>
-              </div>
-            </object>
+              src={previewUrl}
+              title="PDF preview"
+            />
             <div className="preview-actions">
-              <a className="open-link" href={pdfUrl} target="_blank" rel="noreferrer">
+              <a
+                className="open-link"
+                href={serverPdfUrl ?? previewUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
                 Open in new tab
               </a>
             </div>
@@ -239,7 +299,25 @@ export default function App() {
                 <h4>Key Points</h4>
                 <ul>
                   {keyPoints.map((k, i) => (
-                    <li key={i}>{k}</li>
+                    <li key={i}>
+                      <button
+                        className="kp-link"
+                        type="button"
+                        onClick={() => jumpToKeyPoint(i)}
+                        title={
+                          keyPointPages?.[i] != null
+                            ? `Highlight on page ${keyPointPages[i] + 1}`
+                            : "Go to source"
+                        }
+                      >
+                        {k}
+                        {keyPointPages?.[i] != null && (
+                          <span className="kp-page-pill">
+                            p.{keyPointPages[i] + 1}
+                          </span>
+                        )}
+                      </button>
+                    </li>
                   ))}
                 </ul>
               </>

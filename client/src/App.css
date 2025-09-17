@@ -345,3 +345,39 @@ html, body, #root {
   0%, 100% { transform: translateY(0); opacity: 0.6; }
   50%      { transform: translateY(-4px); opacity: 1; }
 }
+
+/* =============== Studify – additions for stable inline highlight =============== */
+
+/* Use iframe to embed PDF viewer so #page & #search are respected */
+.preview-frame {
+  width: 100%;
+  height: min(70vh, 900px);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 12px;
+  background: #11161e;
+  box-shadow: var(--shadow-1);
+  display: block;
+}
+
+/* Flash outline when jumping to a key point (helps on browsers that lack #search highlight) */
+.preview-flash {
+  box-shadow: 0 0 0 3px rgba(65,234,212,0.35) inset;
+}
+
+/* Key point link styling (kept from earlier) */
+.kp-link {
+  all: unset;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  line-height: 1.55;
+}
+.kp-link:hover { text-decoration: underline; }
+.kp-page-pill {
+  font-size: 11px;
+  color: #0a0b10;
+  background: var(--accent-2);
+  padding: 2px 6px;
+  border-radius: 999px;
+}
